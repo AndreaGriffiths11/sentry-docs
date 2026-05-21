@@ -17,13 +17,34 @@ Supported in Sentry's Android SDK version `4.0.0` and above.
 
 Supported in Sentry Android Gradle Plugin version `3.0.0` and above.
 
-Custom instrumentation is supported in Sentry's Android SDK, version `6.21.0` and above.
+Custom instrumentation (`SentrySupportSQLiteOpenHelper` and `SentrySQLiteDriver`) is supported in `sentry-android-sqlite`, SDK version `6.21.0` and above.
 
 </Alert>
+
+## Choosing an instrumentation path
+
+Room can talk to SQLite in two ways. Sentry supports both, but use **only one** path per database so you do not get duplicate `db.sql.query` spans.
+
+| Path | Room API | How Sentry instruments SQL (`db.sql.query`) | Room DAO spans (`db.sql.room`) |
+| ---- | -------- | --------------------------------------------- | ------------------------------ |
+| **Open helper (default)** | `Room.databaseBuilder(...).build()` or `.openHelperFactory { ... }` | [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) bytecode wraps `SupportSQLiteOpenHelper.Factory.create()` → `SentrySupportSQLiteOpenHelper` (requires `sentry-android-sqlite` on the classpath, SDK ≥ 6.21.0) | SAGP when DATABASE tracing is enabled |
+| **SQLite driver (Room 2.7+)** | `Room.databaseBuilder(...).setDriver(...)` | **Manual:** wrap the driver with `SentrySQLiteDriver.create(...)` (SDK ≥ 6.21.0). SAGP does **not** instrument `SQLiteDriver`. | SAGP when DATABASE tracing is enabled |
+
+The Gradle plugin does **not** call `setDriver` for you and does **not** wrap `androidx.sqlite.SQLiteDriver`, `SQLiteConnection`, or `SQLiteStatement`.
+
+### Avoid duplicate SQL spans
+
+- Wrap an **uninstrumented** driver, for example `SentrySQLiteDriver.create(AndroidSQLiteDriver())`.
+- Do **not** stack `SentrySQLiteDriver` on top of `SupportSQLiteDriver` (or similar) if that delegate already uses `SentrySupportSQLiteOpenHelper` or SAGP-instrumented factories.
+- Do **not** use both `openHelperFactory { SentrySupportSQLiteOpenHelper.create(...) }` **and** `setDriver(SentrySQLiteDriver.create(...))` for the same database.
+
+If you migrate from `openHelperFactory` to `setDriver`, span attribute `db.name` may change: open-helper instrumentation uses Room's builder name; the driver uses the **basename** of the path passed to `SQLiteDriver.open()` (for example `tracks` vs `tracks.db`). Filters and dashboards may show both during migration.
 
 ## Auto-Installation With the Sentry Android Gradle Plugin
 
 The [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) provides Room and AndroidX SQLite support through bytecode manipulation. The source can be found [on GitHub](https://github.com/getsentry/sentry-android-gradle-plugin/tree/main/plugin-build/src/main/kotlin/io/sentry/android/gradle/instrumentation).
+
+The plugin instruments **`androidx.sqlite.db.SupportSQLiteOpenHelper.Factory`** and **Room DAOs**. It does **not** instrument **`androidx.sqlite.SQLiteDriver`**. Apps using `Room.databaseBuilder(...).setDriver(...)` must wrap the driver with `SentrySQLiteDriver` themselves (see [SQLite driver (Room 2.7+)](#sqlite-driver-room-27)).
 
 On this page, we get you up and running with Sentry's Room and SQLite Integration, so that it will automatically start a span from an active transaction that's bound to the scope of each sqlite/dao query.
 
@@ -84,6 +105,73 @@ sentry {
 }
 ```
 
+## SQLite driver (Room 2.7+)
+
+Supported in `sentry-android-sqlite`, SDK version **6.21.0** and above (same module as `SentrySupportSQLiteOpenHelper`).
+
+Use this when Room is configured with [`setDriver`](https://developer.android.com/reference/androidx/room/RoomDatabase.Builder#setDriver(androidx.sqlite.SQLiteDriver)) and `androidx.sqlite:sqlite` (for example `AndroidSQLiteDriver`), instead of the default `SupportSQLiteOpenHelper` path.
+
+### Install
+
+Add `sentry-android-sqlite` (or rely on SAGP auto-install when you depend on `androidx.sqlite:sqlite`):
+
+```groovy
+implementation 'io.sentry:sentry-android:{{@inject packages.version('sentry.java.android', '6.21.0') }}'
+implementation 'io.sentry:sentry-android-sqlite:{{@inject packages.version('sentry.java.android.sqlite', '6.21.0') }}'
+```
+
+```kotlin
+implementation("io.sentry:sentry-android:{{@inject packages.version('sentry.java.android', '6.21.0') }}")
+implementation("io.sentry:sentry-android-sqlite:{{@inject packages.version('sentry.java.android.sqlite', '6.21.0') }}")
+```
+
+<Alert>
+
+Enable [tracing](/platforms/android/tracing/#configure-the-sample-rate).
+
+</Alert>
+
+Database bytecode instrumentation from the Gradle plugin is **optional** for this path: SQL spans come from the driver wrapper. You may disable `InstrumentationFeature.DATABASE` if you only use `setDriver` and do not use `SupportSQLiteOpenHelper.Factory`—but then you lose automatic open-helper wrapping and Room DAO (`db.sql.room`) instrumentation unless you add those manually.
+
+### Configure
+
+```kotlin
+import androidx.room.Room
+import androidx.sqlite.driver.AndroidSQLiteDriver
+import io.sentry.android.sqlite.SentrySQLiteDriver
+
+val database = Room.databaseBuilder(context, MyDatabase::class.java, "myapp.db")
+    .setDriver(SentrySQLiteDriver.create(AndroidSQLiteDriver()))
+    .build()
+```
+
+```java
+import androidx.room.Room;
+import androidx.sqlite.driver.AndroidSQLiteDriver;
+import io.sentry.android.sqlite.SentrySQLiteDriver;
+
+final MyDatabase database = Room.databaseBuilder(context, MyDatabase.class, "myapp.db")
+    .setDriver(SentrySQLiteDriver.create(new AndroidSQLiteDriver()))
+    .build();
+```
+
+`SentrySQLiteDriver.create()` is idempotent: calling it twice on the same delegate does not double-wrap.
+
+### SAGP and the driver path
+
+With the [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) and `InstrumentationFeature.DATABASE` enabled:
+
+- **Still applied:** Room DAO instrumentation (`db.sql.room`), auto-install of `sentry-android-sqlite` when applicable.
+- **Not applied to the driver API:** no automatic `SentrySQLiteDriver` / `setDriver` injection.
+
+Typical production setup for driver-only Room:
+
+```kotlin
+.setDriver(SentrySQLiteDriver.create(AndroidSQLiteDriver()))
+```
+
+plus SAGP for DAO spans only—not for `db.sql.query` on the driver (that is the manual wrapper above).
+
 ## Manual Installation
 
 <Alert>
@@ -103,7 +191,9 @@ implementation 'io.sentry:sentry-android-sqlite:{{@inject packages.version('sent
 
 ### Configure
 
-No configuration is required. Just wrap your `SupportSQLiteOpenHelper` instance in `SentrySupportSQLiteOpenHelper`.
+For Room 2.7+ using `setDriver`, see [SQLite driver (Room 2.7+)](#sqlite-driver-room-27) instead of `openHelperFactory`.
+
+No configuration is required for the open-helper path. Just wrap your `SupportSQLiteOpenHelper` instance in `SentrySupportSQLiteOpenHelper`.
 
 ```kotlin
 import io.sentry.android.sqlite.SentrySupportSQLiteOpenHelper
@@ -200,9 +290,13 @@ class EditActivity : ComponentActivity() {
 }
 ```
 
+For driver-based Room, initialize the database with `.setDriver(SentrySQLiteDriver.create(AndroidSQLiteDriver()))` in your own setup code.
+
 To view the recorded transaction, log into [sentry.io](https://sentry.io) and open your project. Clicking on **Performance** will open a page with transactions, where you can select the just recorded transaction with the name `Track Interaction`. The event will look similar to this:
 
 ![Room and AndroidX SQLite performance instrumentation](./img/room-sqlite-instrumentation.png)
+
+A single Room `insert` may show one `db.sql.room` child span (DAO, from SAGP when DATABASE is enabled) and one `db.sql.query` span (SQL, from open-helper instrumentation **or** from `SentrySQLiteDriver`, depending on your path). That is expected. Two `db.sql.query` spans for one statement indicates duplicate instrumentation—check your driver vs open-helper setup.
 
 <Alert>
 
