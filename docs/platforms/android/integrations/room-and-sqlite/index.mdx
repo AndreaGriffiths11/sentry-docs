@@ -17,7 +17,9 @@ Supported in Sentry's Android SDK version `4.0.0` and above.
 
 Supported in Sentry Android Gradle Plugin version `3.0.0` and above.
 
-Custom instrumentation (`SentrySupportSQLiteOpenHelper` and `SentrySQLiteDriver`) is supported in `sentry-android-sqlite`, SDK version `6.21.0` and above.
+`SentrySupportSQLiteOpenHelper` is supported in `sentry-android-sqlite`, SDK version `6.21.0` and above.
+
+`SentrySQLiteDriver` (Room `setDriver`) requires a `sentry-android-sqlite` artifact from the Sentry Android SDK release that adds this API (see the [sentry-java CHANGELOG](https://github.com/getsentry/sentry-java/blob/main/CHANGELOG.md#unreleased)).
 
 </Alert>
 
@@ -28,7 +30,7 @@ Room can talk to SQLite in two ways. Sentry supports both, but use **only one** 
 | Path | Room API | How Sentry instruments SQL (`db.sql.query`) | Room DAO spans (`db.sql.room`) |
 | ---- | -------- | --------------------------------------------- | ------------------------------ |
 | **Open helper (default)** | `Room.databaseBuilder(...).build()` or `.openHelperFactory { ... }` | [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) bytecode wraps `SupportSQLiteOpenHelper.Factory.create()` → `SentrySupportSQLiteOpenHelper` (requires `sentry-android-sqlite` on the classpath, SDK ≥ 6.21.0) | SAGP when DATABASE tracing is enabled |
-| **SQLite driver (Room 2.7+)** | `Room.databaseBuilder(...).setDriver(...)` | **Manual:** wrap the driver with `SentrySQLiteDriver.create(...)` (SDK ≥ 6.21.0). SAGP does **not** instrument `SQLiteDriver`. | SAGP when DATABASE tracing is enabled |
+| **SQLite driver (Room 2.7+)** | `Room.databaseBuilder(...).setDriver(...)` | **Manual:** wrap the driver with `SentrySQLiteDriver.create(...)` (SDK release that includes `SentrySQLiteDriver`). SAGP does **not** instrument `SQLiteDriver`. | SAGP when DATABASE tracing is enabled |
 
 The Gradle plugin does **not** call `setDriver` for you and does **not** wrap `androidx.sqlite.SQLiteDriver`, `SQLiteConnection`, or `SQLiteStatement`.
 
@@ -107,7 +109,7 @@ sentry {
 
 ## SQLite driver (Room 2.7+)
 
-Supported in `sentry-android-sqlite`, SDK version **6.21.0** and above (same module as `SentrySupportSQLiteOpenHelper`).
+Supported in `sentry-android-sqlite` (same module as `SentrySupportSQLiteOpenHelper`). Requires a SDK version that ships `SentrySQLiteDriver` — see the [sentry-java CHANGELOG](https://github.com/getsentry/sentry-java/blob/main/CHANGELOG.md#unreleased). The `SentrySupportSQLiteOpenHelper` API remains available from **6.21.0** and above.
 
 Use this when Room is configured with [`setDriver`](https://developer.android.com/reference/androidx/room/RoomDatabase.Builder#setDriver(androidx.sqlite.SQLiteDriver)) and `androidx.sqlite:sqlite` (for example `AndroidSQLiteDriver`), instead of the default `SupportSQLiteOpenHelper` path.
 

@@ -48,6 +48,12 @@ sentry {
 
 The `io.sentry.android.gradle` enables the tracing instrumentation (via bytecode manipulation) for `androidx.sqlite` and `androidx.room` libraries by default, to disable it, see the code snippet below.
 
+<Alert>
+
+Current behavior (open-helper factory wrapping, Room DAOs, and `SQLiteDriver` scope) is documented on [Room and SQLite](/platforms/android/integrations/room-and-sqlite/) and [Gradle plugin configuration](/platforms/android/configuration/gradle/#tracing-auto-instrumentation).
+
+</Alert>
+
 ```groovy
 sentry {
     // Enable or disable the tracing instrumentation.
