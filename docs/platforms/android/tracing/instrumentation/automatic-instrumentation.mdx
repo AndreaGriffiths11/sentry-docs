@@ -234,9 +234,11 @@ For more information see our [Apollo integration](/platforms/android/integration
 
 ### SQLite and Room Instrumentation
 
-The [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) does tracing auto instrumentation using bytecode manipulation for `androidx.sqlite` and `androidx.room` libraries.
+The [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) does tracing auto instrumentation using bytecode manipulation for `androidx.sqlite.db.SupportSQLiteOpenHelper` and `androidx.room` (DAO methods and open-helper factory wrapping). It does **not** instrument `androidx.sqlite.SQLiteDriver` or `Room.databaseBuilder.setDriver`.
 
-The Plugin injects a code snippet that starts a span out of the active span bound to the scope for each `CRUD` operation. The SDK sets the span `operation` to `db` and `description` to the SQL Query if available.
+If your app uses Room 2.7+ with `setDriver`, wrap the driver with `SentrySQLiteDriver` yourself. See [Room and SQLite](/platforms/android/integrations/room-and-sqlite/#choosing-an-instrumentation-path).
+
+The Plugin injects a code snippet that starts a span out of the active span bound to the scope for each `CRUD` operation on the open-helper path. The SDK sets the span `operation` to `db` and `description` to the SQL Query if available.
 
 The span finishes once the operation has been executed. The span `status` is set to `SpanStatus.OK` if successful or `SpanStatus.INTERNAL_ERROR` if there was any error.
 

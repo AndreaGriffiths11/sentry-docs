@@ -451,8 +451,9 @@ The plugin supports the following features for auto-instrumentation:
 ```kotlin
 enum class InstrumentationFeature {
     /**
-     * When enabled the SDK will create spans for any CRUD operation performed by 'androidx.sqlite'
-     * and 'androidx.room'. This feature uses bytecode manipulation.
+     * When enabled and sentry-android-sqlite is on the classpath, bytecode wraps
+     * SupportSQLiteOpenHelper.Factory and instruments Room DAOs (db.sql.query and db.sql.room).
+     * Does not instrument SQLiteDriver or Room.setDriver; use SentrySQLiteDriver manually.
      *
      * Requires sentry-android SDK version 4.0.0 and above
      */
@@ -490,6 +491,8 @@ enum class InstrumentationFeature {
 ```
 
 Check [Integrations](/platforms/android/integrations/) page for more detailed explanation of each instrumentation feature.
+
+For `InstrumentationFeature.DATABASE`, the plugin instruments `SupportSQLiteOpenHelper.Factory` and Room DAOs when `sentry-android-sqlite` is present. It does not wrap `androidx.sqlite.SQLiteDriver` or call `Room.databaseBuilder.setDriver`. Apps on the [SQLite driver path](/platforms/android/integrations/room-and-sqlite/#sqlite-driver-room-27) must use `SentrySQLiteDriver.create(...)` manually. See [Room and SQLite](/platforms/android/integrations/room-and-sqlite/#choosing-an-instrumentation-path) for avoiding duplicate `db.sql.query` spans.
 
 <Alert>
 
