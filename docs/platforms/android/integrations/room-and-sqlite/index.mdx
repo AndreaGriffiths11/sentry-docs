@@ -48,7 +48,7 @@ The [Sentry Android Gradle Plugin](/platforms/android/configuration/gradle/) pro
 
 The plugin instruments **`androidx.sqlite.db.SupportSQLiteOpenHelper.Factory`** and **Room DAOs**. It does **not** instrument **`androidx.sqlite.SQLiteDriver`**. Apps using `Room.databaseBuilder(...).setDriver(...)` must wrap the driver with `SentrySQLiteDriver` themselves (see [SQLite driver (Room 2.7+)](#sqlite-driver-room-27)).
 
-On this page, we get you up and running with Sentry's Room and SQLite Integration, so that it will automatically start a span from an active transaction that's bound to the scope of each sqlite/dao query.
+On this page, we get you up and running with Sentry's Room and SQLite integration. With the Gradle plugin and default Room setup, SQL and DAO operations start spans from the active transaction bound to the scope. With `setDriver`, SQL spans come from your `SentrySQLiteDriver` wrapper; DAO spans still come from the plugin when DATABASE instrumentation is enabled.
 
 ### Install
 
