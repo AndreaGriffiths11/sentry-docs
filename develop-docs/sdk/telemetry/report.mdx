@@ -1,0 +1,533 @@
+---
+title: report()
+description: Unified error reporting API — replaces captureException and captureMessage with a single polymorphic method.
+spec_id: sdk/telemetry/report
+spec_version: 0.1.0
+spec_status: draft
+spec_depends_on:
+  - id: sdk/telemetry/errors
+    version: ">=1.8.0"
+  - id: sdk/foundations/client
+    version: ">=2.0.0"
+  - id: sdk/foundations/state-management/scopes
+    version: ">=1.0.0"
+  - id: sdk/telemetry/sessions
+    version: ">=1.7.0"
+spec_changelog:
+  - version: 0.1.0
+    date: 2026-06-16
+    summary: Initial spec — unified report() method, argument resolution, stack trace generation, deprecation of captureException and captureMessage
+sidebar_order: 0
+---
+
+<SpecRfcAlert />
+
+<SpecMeta />
+
+## Overview
+
+`report()` is the unified public API for manually reporting errors to Sentry. It replaces `captureException` and `captureMessage` with a single method that accepts both exception objects and string messages. The SDK inspects the argument type and does the right thing.
+
+### Why `report`?
+
+`report` implies escalation — something went wrong and someone needs to know. It carries urgency and directionality: you _report to_ someone.
+
+`log` implies bookkeeping — recording facts for later reference. No urgency, no audience, just a ledger.
+
+`capture` is the problem child — it just means "grab and record," which overlaps with both. An LLM has to inspect arguments and context to decide if `capture('disk full')` is an error report or a log entry. With `report('disk full')`, the intent is obvious.
+
+### Prior Art
+
+The verb `report` has broad precedent across frameworks, platform APIs, error tracking SDKs, and language-level error types.
+
+#### Web Frameworks
+
+- **Rails**: `Rails.error.report(error, handled: true, context: { ... })` — the standard API for reporting handled exceptions since Rails 7.
+- **Laravel**: `report($exception)` / `report('Something went wrong')` — global helper and exception-level `report()` method.
+
+#### Platform APIs
+
+- **Web API**: `window.reportError(throwable)` / `self.reportError()` — built into all modern browsers and Web Workers. Dispatches an `ErrorEvent` or `PromiseRejectionEvent` on the global, making it visible to `window.onerror` and monitoring tools. The spec explicitly chose `report` for its escalation semantics.
+- **Flutter**: `FlutterError.reportError(FlutterErrorDetails)` — the framework's recommended API for reporting caught errors. The docs say "do not call `onError` directly; instead, call `reportError`."
+- **Erlang/OTP**: `error_logger:error_report(Report)` — the noun "report" is the standard term for structured error data throughout the BEAM ecosystem.
+- **CSP / Reporting API**: The W3C Content Security Policy and Reporting API use `report` as the canonical verb — `report-uri`, `report-to`, `ReportingObserver`, `Report` objects. Error escalation across a security boundary.
+
+#### Error Tracking SDKs
+
+- **Google Cloud Error Reporting**: `report()` across all SDKs — Node.js (`errors.report(error)`), Python (`client.report(message)`), Go (`client.Report(entry)`), Ruby (`ErrorReporting.report(exception)`). The only major error tracking service to consistently use `report()` as its primary verb across languages.
+- **Airbrake** (Java): `Airbrake.report(throwable)` / `Airbrake.reportSync(throwable)` — Java SDK uses `report`, though other Airbrake SDKs use `notify()`.
+
+#### Rust Error Ecosystem
+
+Rust uses `Report` as the **type name** for error wrappers across its ecosystem:
+
+- **`eyre::Report`** — the central error type (fork of `anyhow`), used as `Result<T, eyre::Report>`. The crate's docs describe it as "use eyre if you don't think you'll do anything other than report it."
+- **`error_stack::Report<C>`** — typed-context error type with frame stacks and attachments.
+- **`std::error::Report<E>`** — nightly-only error reporter in the standard library (tracking issue #90172).
+- **`snafu::Report<E>`** / **`miette::Report`** — additional crates using `Report` as their error wrapper type.
+- **`std::process::Termination::report()`** — stable since Rust 1.61: `fn report(self) -> ExitCode`. How `main()` return values become exit codes.
+
+The Rust ecosystem's convergence on `Report` as a type name reinforces the association between the word and structured error representation.
+
+
+---
+
+## Concepts
+
+**Argument polymorphism**: `report()` accepts any argument that represents an error. What qualifies as "an error" varies by language — a thrown `Exception` in Java, an `error` interface value in Go, a `sentry_value_t` in C, or a plain string in any language. The SDK determines processing based on the type of the argument.
+
+**Automatic stack trace generation**: Many error types do not carry a stack trace. Go's `error` interface is a string wrapper. C has no exception model. Even in languages with rich exception types, a user may pass a plain string. When the input does not carry a parseable stack trace, the SDK **MUST** generate one at the call site using platform-appropriate mechanisms. This is on by default and can be suppressed per-call.
+
+**Deprecation**: `captureException`, `captureMessage`, and the `attachStackTrace` configuration option are deprecated in favor of `report()`.
+
+---
+
+## Behavior
+
+<SpecSection id="argument-resolution" status="draft" since="0.1.0">
+
+### Argument Resolution
+
+`report()` **MUST** determine how to process its first argument based on the argument's type. The two processing paths are:
+
+**Exception path** — the SDK extracts the exception type, value, and stack trace (if available), populating the `exception` interface as defined in the [Errors spec](/sdk/telemetry/errors/#exception-interface). The mechanism **MUST** be set to `{ type: "generic", handled: true }`.
+
+**String path** — the SDK creates an error event with the string as the event `message`. Unless the caller opts out via the `stacktrace` option, the SDK **MUST** also generate a stack trace at the call site and attach it as a synthetic exception (see [Stack Trace Generation](#stack-trace-generation)).
+
+How the SDK maps argument types to these paths depends on the language:
+
+| Language | Exception Path | String Path | Other |
+|---|---|---|---|
+| JavaScript | `Error` and subclasses (`instanceof Error`) | `string` (`typeof`) | Other types: coerce via `String()`, use string path |
+| Python | `BaseException` and subclasses (`isinstance`) | `str` | Other types: coerce via `str()`, use string path |
+| Go | Values implementing the `error` interface | `string` | — |
+| Java | `Throwable` and subclasses | `String` | `Object`: coerce via `.toString()`, use string path |
+| Swift | Values conforming to `Error` protocol, `NSError`, `NSException` | `String` | — |
+| C | `sentry_value_t` with exception type | `sentry_value_t` with string type | Determined by `sentry_value_t` type field |
+
+For languages with null types (`null`, `nil`, `None`, `NULL`), the SDK **SHOULD** create an error event with a descriptive message (e.g., `"report() called with nil"`) and generate a stack trace at the call site.
+
+#### Static Typing Considerations
+
+In statically typed languages, the SDK **MAY** use method overloading or generics to provide compile-time type safety:
+
+```java
+// Java — overloaded methods
+Sentry.report(Throwable error);
+Sentry.report(Throwable error, ReportOptions options);
+Sentry.report(String message);
+Sentry.report(String message, ReportOptions options);
+```
+
+```go
+// Go — accepts any; type-switch internally
+func Report(input any, options ...*ReportOptions)
+```
+
+```swift
+// Swift — separate labeled parameters
+SentrySDK.report(error: Error, options: ReportOptions?)
+SentrySDK.report(message: String, options: ReportOptions?)
+```
+
+In C, the SDK works with `sentry_value_t` throughout — there is no polymorphism at the language level. The SDK inspects the value's type tag to choose the processing path.
+
+</SpecSection>
+
+<SpecSection id="stack-trace-generation" status="draft" since="0.1.0">
+
+### Stack Trace Generation
+
+When `report()` receives an argument that does not contain a parseable stack trace, the SDK **MUST** generate one at the call site by default. This behavior can be suppressed by passing the `stacktrace: false` option.
+
+The generated stack trace **MUST** exclude SDK-internal frames — the `report()` implementation itself and any internal dispatch frames. The top frame **SHOULD** be the user code that called `report()`.
+
+The generated exception **MUST** have its mechanism set to:
+
+```json
+{
+  "type": "generic",
+  "handled": true,
+  "synthetic": true
+}
+```
+
+The `synthetic` flag tells Sentry to use the top in-app frame for grouping rather than the exception type and value, consistent with the [synthetic exceptions](/sdk/telemetry/errors/#synthetic-exceptions) behavior.
+
+#### When Stack Trace Generation Applies
+
+Not all error types carry stack traces. The SDK **MUST** generate a stack trace in these cases unless the caller opts out:
+
+| Input | Has Stack Trace? | SDK Generates? |
+|---|---|---|
+| **String** (any language) | No | Yes |
+| **Go `error`** | No (interface is just `Error() string`) | Yes |
+| **C `sentry_value_t`** (exception without frames) | No | Yes, if platform supports it |
+| **Java `Throwable`** | Yes (`getStackTrace()`) | No — use the existing trace |
+| **Python `BaseException`** | Yes (`__traceback__`) | No — use the existing trace |
+| **JavaScript `Error`** | Yes (`.stack` property) | No — use the existing trace |
+| **Swift `NSException`** | Yes (`callStackSymbols`) | No — use the existing trace |
+| **Swift `Error` protocol** | No (protocol has no trace) | Yes |
+
+#### Platform-Specific Capture Mechanisms
+
+The mechanism for capturing a stack trace at the call site varies by platform. SDKs **SHOULD** use the most accurate mechanism available:
+
+| Platform | Capture Mechanism | Frame Stripping Strategy |
+|---|---|---|
+| JavaScript | `new Error().stack` — works across V8, SpiderMonkey, and JSC. Parse with engine-specific regex (V8 uses `at func (file:line:col)`, Gecko/JSC use `func@file:line:col`). Source maps are applied server-side. | Strip frames by matching function names (e.g., regex for `report`/SDK-internal names). |
+| Python | `sys._getframe(1)` with manual `f_back` walking — fastest option, works across CPython, PyPy, and GraalPy. Avoid `inspect.stack()` (pathologically slow due to per-frame `sys.modules` iteration). | Strip frames where `frame.f_globals["__name__"]` starts with the SDK module prefix. Support `__tracebackhide__` magic variable. |
+| Go | `runtime.Callers(skip, pcs)` to capture raw PCs, then `runtime.CallersFrames(pcs)` for symbolization. `CallersFrames` correctly expands inlined functions. Use `skip=2` to exclude `runtime.Callers` and the SDK function. | Strip frames where the module name starts with the SDK module path. Symbolize lazily — store raw `[]uintptr` and only call `CallersFrames` when serializing. |
+| Java | `new Throwable().getStackTrace()` for simplicity, or `StackWalker.walk()` (Java 9+) for efficiency with `skip()` and `limit()`. Both preserve inlined frames (HotSpot via ScopeDesc, ART via InlineInfo). | Strip frames where the class package starts with the SDK package prefix. On Android, `StackWalker` is unavailable — use `new Throwable()`. |
+| Swift | `Thread.callStackReturnAddresses` or C `backtrace()` for raw addresses. On iOS 15+ / macOS 12+, prefer `backtrace_async()` for async/await contexts. Symbolication is server-side via dSYMs. | Strip leading frames whose image path contains the SDK framework name. Compile-time literals (`#fileID`, `#line`, `#function`) as default parameters provide a guaranteed call-site anchor even in stripped release builds. |
+| C | Platform-dependent: `backtrace()` (glibc, macOS), `_Unwind_Backtrace` (GCC/Clang — works on musl, Android NDK), libunwind (broadest portability), `CaptureStackBackTrace()` (Windows). Compile with `-funwind-tables` on ARM. | Capture raw instruction pointers and binary image metadata (base address, build-ID/UUID). All symbolication is server-side. |
+
+On platforms where stack trace capture is unavailable or unreliable (e.g., embedded C targets without unwind tables, release-mode Swift without `backtrace_async` in async contexts), the SDK **MAY** omit the synthetic stack trace and **SHOULD** still create the error event without it.
+
+#### `attachStackTrace` Deprecation
+
+The `attachStackTrace` configuration option controlled whether `captureMessage` generates a stack trace. With `report()`, stack trace generation for non-exception arguments is on by default and controlled per-call via the `stacktrace` option. The `attachStackTrace` option **SHOULD** be deprecated.
+
+</SpecSection>
+
+<SpecSection id="exception-mechanism" status="draft" since="0.1.0">
+
+### Exception Mechanism
+
+For user-invoked `report()` calls, the mechanism `type` **MUST** default to `'generic'` with `handled: true`, consistent with existing behavior for [user-invoked captures](/sdk/telemetry/errors/#mechanism-type-naming).
+
+When `report()` generates a synthetic stack trace (for strings or non-exception types), the mechanism **MUST** also include `synthetic: true`.
+
+SDKs and integrations **MAY** override the mechanism when calling `report()` internally (e.g., from an unhandled exception handler), following the [mechanism type naming](/sdk/telemetry/errors/#mechanism-type-naming) rules.
+
+</SpecSection>
+
+<SpecSection id="event-level" status="draft" since="0.1.0">
+
+### Event Level
+
+When `report()` receives an exception/error object, the event level **MUST** default to `error`.
+
+When `report()` receives a string, the event level **MUST** default to `error`.
+
+The user **MAY** override the level via the `level` option.
+
+`captureMessage` previously defaulted to `info`. The change to `error` is intentional — `report()` means something is wrong. If users want informational or diagnostic messages, they should use [Sentry Logs](/sdk/telemetry/logs/).
+
+</SpecSection>
+
+<SpecSection id="session-error-counting" status="draft" since="0.1.0">
+
+### Session Error Counting
+
+The [Sessions spec](/sdk/telemetry/sessions/#error-counting) differentiates between `captureException` (increments session error counter when level is `error` or higher) and `captureMessage` (never increments). With `report()`, this distinction **MUST** be based on which processing path the input takes (see [Argument Resolution](#argument-resolution)):
+
+| Processing Path | Level | Increments `errors` |
+|---|---|---|
+| Exception path | `fatal` | Yes |
+| Exception path | `error` | Yes |
+| Exception path | `warning` | No |
+| String path | any | No |
+
+This preserves backward compatibility in session health metrics.
+
+</SpecSection>
+
+---
+
+## Public API
+
+<SpecSection id="report-method" status="draft" since="0.1.0">
+
+### `report()`
+
+```pseudocode
+report(input, options?) -> event_id
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `input` | Language-specific error or string type | **REQUIRED** | The error or message to report. |
+| `options` | Options struct / object / kwargs | **OPTIONAL** | Overrides for this report (see below). |
+
+#### Options
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `level` | `SentryLevel` | `error` | Override the event level. |
+| `stacktrace` | `boolean` | `true` | Set to `false` to suppress synthetic stack trace generation for non-exception inputs. Has no effect when `input` takes the exception path (the stack trace comes from the error object itself). |
+| `context` | Key-value map | — | Arbitrary user data. Flows through the event pipeline and is accessible in `before_send` and event processors. |
+
+**Returns**: The event ID (string/UUID) of the created event, or a null/empty value if the event was discarded.
+
+The method **MUST** operate on the current scope, consistent with the existing [capture functions](/sdk/foundations/state-management/scopes/#capture-functions).
+
+#### Language-Specific Signatures
+
+SDKs **SHOULD** use `report` as the method name. SDKs **MAY** adapt casing, parameter style, and options idioms to language conventions:
+
+```javascript
+// JavaScript / TypeScript
+Sentry.report(input, options?)
+// options: { level?, stacktrace?, context? }
+```
+
+```python
+# Python
+sentry_sdk.report(input, *, level=None, stacktrace=True, context=None)
+```
+
+```go
+// Go
+sentry.Report(input any, options ...*ReportOptions) *EventID
+
+type ReportOptions struct {
+    Level      Level
+    Stacktrace *bool
+    Context    map[string]any
+}
+```
+
+```java
+// Java
+Sentry.report(Throwable error);
+Sentry.report(Throwable error, ReportOptions options);
+Sentry.report(String message);
+Sentry.report(String message, ReportOptions options);
+```
+
+```swift
+// Swift
+SentrySDK.report(error: Error, options: ReportOptions?)
+SentrySDK.report(message: String, options: ReportOptions?)
+
+struct ReportOptions {
+    var level: SentryLevel?
+    var stacktrace: Bool = true
+    var context: [String: Any]?
+}
+```
+
+```c
+// C
+sentry_uuid_t sentry_report(sentry_value_t input);
+sentry_uuid_t sentry_report_with_options(sentry_value_t input, sentry_report_options_t opts);
+```
+
+### `Client.report()`
+
+The Client **MUST** also expose a `report(input, scope)` method for direct invocation without the top-level convenience wrapper, consistent with the existing [capture methods](/sdk/foundations/client/#capture-methods) on the Client.
+
+</SpecSection>
+
+<SpecSection id="deprecation" status="draft" since="0.1.0">
+
+### Deprecation
+
+The following are deprecated in favor of `report()`:
+
+| Deprecated | Replacement |
+|---|---|
+| `captureException` / `capture_exception` / `CaptureException` | `report` / `Report` |
+| `captureMessage` / `capture_message` / `CaptureMessage` | `report` / `Report` |
+| `attachStackTrace` / `attach_stacktrace` option | `stacktrace` option on `report()` |
+
+`captureEvent` is **not** deprecated — it remains the low-level API for pre-built events.
+
+During the deprecation period:
+
+- Both methods **MUST** continue to function as specified in the [Errors](/sdk/telemetry/errors/) and [Client](/sdk/foundations/client/) specs.
+- SDKs **SHOULD** emit a deprecation warning via the SDK's debug/diagnostic logger (not to stderr or the console) when these methods are called.
+- SDKs **MAY** internally delegate `captureException` and `captureMessage` to `report()`.
+- In a future major version, SDKs **MAY** remove `captureException` and `captureMessage`.
+
+</SpecSection>
+
+---
+
+## Examples
+
+### Report an Exception
+
+```javascript
+Sentry.report(new Error("payment failed"));
+```
+
+```python
+sentry_sdk.report(ValueError("payment failed"))
+```
+
+```go
+sentry.Report(fmt.Errorf("payment failed"))
+```
+
+```java
+Sentry.report(new RuntimeException("payment failed"));
+```
+
+```swift
+SentrySDK.report(error: PaymentError.declined)
+```
+
+```c
+sentry_value_t exc = sentry_value_new_exception("PaymentError", "payment failed");
+sentry_report(exc);
+```
+
+### Report a String
+
+```javascript
+Sentry.report("disk space critically low");
+```
+
+```python
+sentry_sdk.report("disk space critically low")
+```
+
+```go
+sentry.Report("disk space critically low")
+```
+
+```java
+Sentry.report("disk space critically low");
+```
+
+```swift
+SentrySDK.report(message: "disk space critically low")
+```
+
+### Report with Options
+
+```javascript
+Sentry.report(error, {
+  level: "fatal",
+  context: { orderId: 123, region: "eu-west" },
+});
+```
+
+```python
+sentry_sdk.report(
+    error,
+    level="fatal",
+    context={"order_id": 123, "region": "eu-west"},
+)
+```
+
+```go
+sentry.Report(err, &sentry.ReportOptions{
+    Level:   sentry.LevelFatal,
+    Context: map[string]any{"orderID": 123, "region": "eu-west"},
+})
+```
+
+```java
+Sentry.report(error, new ReportOptions() {{
+    setLevel(SentryLevel.FATAL);
+    setContext(Map.of("orderId", 123, "region", "eu-west"));
+}});
+```
+
+```swift
+SentrySDK.report(error: error, options: .init(
+    level: .fatal,
+    context: ["orderId": 123, "region": "eu-west"]
+))
+```
+
+### Report Without Stack Trace
+
+```python
+sentry_sdk.report("cache miss rate high", stacktrace=False, level="warning")
+```
+
+```go
+sentry.Report("cache miss rate high", &sentry.ReportOptions{
+    Stacktrace: sentry.Bool(false),
+    Level:      sentry.LevelWarning,
+})
+```
+
+```javascript
+Sentry.report("cache miss rate high", { stacktrace: false, level: "warning" });
+```
+
+### Wire Format
+
+Both processing paths produce the same envelope structure. The key differences are the `synthetic` flag on the mechanism and whether the stack trace was extracted from the error object or generated by the SDK.
+
+Exception path (stack trace from the error object):
+
+```json
+{
+  "exception": {
+    "values": [
+      {
+        "type": "ValueError",
+        "value": "payment failed",
+        "mechanism": { "type": "generic", "handled": true },
+        "stacktrace": {
+          "frames": [
+            { "filename": "payments.py", "function": "process", "lineno": 42 }
+          ]
+        }
+      }
+    ]
+  },
+  "level": "error"
+}
+```
+
+String path (stack trace generated at call site by the SDK):
+
+```json
+{
+  "message": "disk space critically low",
+  "exception": {
+    "values": [
+      {
+        "type": "Error",
+        "value": "disk space critically low",
+        "mechanism": { "type": "generic", "handled": true, "synthetic": true },
+        "stacktrace": {
+          "frames": [
+            { "filename": "monitor.go", "function": "main.checkDisk", "lineno": 87 }
+          ]
+        }
+      }
+    ]
+  },
+  "level": "error"
+}
+```
+
+String path with `stacktrace: false`:
+
+```json
+{
+  "message": "cache miss rate high",
+  "level": "warning"
+}
+```
+
+### Migration
+
+| Language | Before | After |
+|---|---|---|
+| JavaScript | `Sentry.captureException(err)` | `Sentry.report(err)` |
+| JavaScript | `Sentry.captureMessage("msg")` | `Sentry.report("msg")` |
+| JavaScript | `Sentry.captureMessage("msg", "warning")` | `Sentry.report("msg", { level: "warning" })` |
+| Python | `sentry_sdk.capture_exception(err)` | `sentry_sdk.report(err)` |
+| Python | `sentry_sdk.capture_message("msg")` | `sentry_sdk.report("msg")` |
+| Python | `sentry_sdk.capture_message("msg", level="warning")` | `sentry_sdk.report("msg", level="warning")` |
+| Go | `sentry.CaptureException(err)` | `sentry.Report(err)` |
+| Go | `sentry.CaptureMessage("msg")` | `sentry.Report("msg")` |
+| Java | `Sentry.captureException(err)` | `Sentry.report(err)` |
+| Java | `Sentry.captureMessage("msg")` | `Sentry.report("msg")` |
+| Swift | `SentrySDK.capture(error: err)` | `SentrySDK.report(error: err)` |
+| Swift | `SentrySDK.capture(message: "msg")` | `SentrySDK.report(message: "msg")` |
+
+---
+
+## Changelog
+
+<SpecChangelog />
